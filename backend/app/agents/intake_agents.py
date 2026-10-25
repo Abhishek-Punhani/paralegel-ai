@@ -1,0 +1,822 @@
+"""
+NyayaLens — Intake Agents
+All async node functions for the LangGraph intake graph.
+Each uses real LLM calls via langchain_google_genai, wired to the
+production prompts library. Evidence provenance is set at write-time on
+every Fact produced.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import logging
+import uuid
+from datetime import datetime, timezone
+from typing import Any
+
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.types import interrupt
+from pydantic import BaseModel as _PydanticBase
+
+from app.config import GOOGLE_API_KEY, MODEL_FLASH
+from app.intake_engine.engine import (
+    MergeError,
+    apply_derivations,
+    current_stage,
+    derive_flags,
+    is_complete,
+    new_intake,
+    next_question,
+    process_turn,
+    project_entity_graph,
+    project_facts,
+    project_profile,
+    project_victim_profile,
+    project_timeline,
+    register_failed_turn,
+    safety_question,
+)
+from app.intake_engine.extractor import IntakeExtractor
+from app.services.llm import text_llm
+from app.legal_data.Motor_accident_schema import (
+    get_missing_fields_by_phase,
+    get_next_priority_field,
+)
+from app.legal_data.section_mapping import get_applicable_law
+from app.prompts.analysis_prompts import CONFIRMATION_FLOW_PROMPTS
+from app.prompts.loader import render_prompt
+from app.schemas.llm_schemas import (
+    CaseTypeOutput,
+    CrossQuestionOutput,
+    EntityTrackerOutput,
+    FuzzinessOutput,
+    DocumentRequestOutput,
+    ConsentIntentOutput,
+)
+from app.state import (
+    CaseState,
+    ConsentRecord,
+    DocumentRecord,
+    Fact,
+    FuzzinessFlag,
+)
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+TEMPERATURE         = 0.1
+MAX_RETRIES         = 2
+TRANSCRIPT_WINDOW   = 20
+CONVERSATION_WINDOW = 10
+CONSENT_MAX_RETRIES = 2
+DEFAULT_LAWYER_NAME = "Vakeel Sahab"
+
+_ELECTRONIC_EVIDENCE_TYPES: frozenset[str] = frozenset({
+    "cctv_footage", "dashcam_recording", "mobile_video", "audio_recording",
+    "whatsapp_message_screenshot", "call_recording", "social_media_post",
+    "email", "sms_screenshot", "traffic_camera_footage",
+})
+
+
+# ---------------------------------------------------------------------------
+# Shared LLM factory
+# ---------------------------------------------------------------------------
+
+def _flash_llm() -> ChatGoogleGenerativeAI:
+    return text_llm("flash")
+
+
+def _facts_to_json(facts: list[Fact]) -> str:
+    return json.dumps([f.model_dump() for f in facts], ensure_ascii=False, indent=2)
+
+
+def _flags_to_json(flags: list[FuzzinessFlag]) -> str:
+    return json.dumps([f.model_dump() for f in flags], ensure_ascii=False, indent=2)
+
+
+def _retry_prompt(reason: str, lawyer_name: str) -> str:
+    return (
+        f"Mujhe thoda confusion hua — {reason} Kripya spasht batayein: "
+        f"kya {lawyer_name} ko brief bhejna hai? Sirf 'haan' ya 'nahin' boliye."
+    )
+
+
+# ---------------------------------------------------------------------------
+# BSA §63 classification — structured LLM call, NOT substring matching
+# ---------------------------------------------------------------------------
+
+async def _classify_doc_needs_bsa63(llm: ChatGoogleGenerativeAI, doc_type: str) -> bool:
+    """
+    Classifies whether a document requires a BSA §63 electronic-evidence
+    certificate. Uses a structured LLM call against a closed taxonomy.
+    Fails SAFE: errors default to True (over-request rather than miss cert).
+    """
+    class _DocClass(_PydanticBase):
+        canonical_type: str
+        needs_bsa63_certificate: bool
+        reason: str
+
+    try:
+        prompt = (
+            f"You are a legal evidence classifier under the Bharatiya Sakshya Adhiniyam 2023.\n"
+            f"Classify this document type: '{doc_type}'\n"
+            f"Types requiring BSA §63 certificate: {sorted(_ELECTRONIC_EVIDENCE_TYPES)}\n"
+            f"Return: canonical_type (closest match or 'physical_document'), "
+            f"needs_bsa63_certificate (true if electronic), reason (one sentence)."
+        )
+        result = await llm.with_structured_output(_DocClass).ainvoke([("system", prompt)])
+        return result.needs_bsa63_certificate
+    except Exception as exc:
+        logger.warning("BSA §63 classification failed for '%s', defaulting True: %s", doc_type, exc)
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Node 1 — Case-Type Router
+# ---------------------------------------------------------------------------
+
+async def case_type_router_node(state: CaseState) -> dict:
+    """
+    Determines case type from the client's opening narrative and, for motor
+    accident cases, resolves the accident sub-type so downstream nodes know
+    which statutory provisions to pull.
+    """
+    try:
+        messages = state.get("messages", [])
+        language = state.get("language", "hi")
+
+        llm = _flash_llm()
+        system_prompt = render_prompt("case_type_router.yaml", {"language": language})
+
+        conversation = [("system", system_prompt)]
+        for msg in messages[-6:]:
+            if isinstance(msg, HumanMessage):
+                conversation.append(("human", msg.content))
+            elif isinstance(msg, AIMessage):
+                conversation.append(("ai", msg.content))
+
+        conversation.append(("human", "Classify the case type and accident subtype."))
+
+        try:
+            response = await llm.with_structured_output(CaseTypeOutput).ainvoke(conversation)
+            case_type = response.case_type
+            subtype = response.accident_subtype
+        except Exception as exc:
+            logger.error("case_type_router structured output failed: %s", exc)
+            case_type = "unknown"
+            subtype = "not_applicable"
+
+        if case_type == "unknown":
+            return {
+                "case_type": "unknown",
+                "accident_subtype": "not_applicable",
+                "law_version_context": "unknown",
+                "intake_phase": "human_handoff",
+            }
+
+        return {
+            "case_type": case_type,
+            "accident_subtype": subtype,
+            "law_version_context": "unknown",
+            "intake_phase": "cross_question",
+        }
+
+    except Exception as exc:
+        logger.error("case_type_router_node error: %s", exc, exc_info=True)
+        return {
+            "case_type": "motor_accident",
+            "accident_subtype": "not_applicable",
+            "law_version_context": "unknown",
+            "intake_phase": "cross_question",
+        }
+
+
+# ---------------------------------------------------------------------------
+# Node 2 — Cross-Questioning Agent (PEACE Model)
+# ---------------------------------------------------------------------------
+
+_STAGE_ORDER = [
+    "engage", "narrative", "timeline_liability",
+    "regulatory", "quantum_profiling", "defense_audit", "closure",
+]
+
+
+async def cross_question_node(state: CaseState) -> dict:
+    """
+    Conducts the PEACE-model phased interview for motor accident cases.
+    Stages: engage → narrative → timeline_liability → regulatory →
+            quantum_profiling → defense_audit → closure
+    """
+    try:
+        llm = _flash_llm()
+        language = state.get("language", "hi")
+        facts = state.get("facts", [])
+        fuzziness_flags = state.get("fuzziness_flags", [])
+        subtype = state.get("accident_subtype", "not_applicable")
+        current_stage = state.get("interview_stage") or "engage"
+        client_profile = state.get("client_profile") or {}
+
+        missing_by_phase = get_missing_fields_by_phase(facts)
+        unresolved_flags = [f for f in fuzziness_flags if not f.resolved]
+
+        system_prompt = render_prompt("cross_question.yaml", {
+            "language": language,
+            "interview_stage": current_stage,
+            "facts_json": _facts_to_json(facts),
+            "accident_subtype": subtype,
+            "missing_fields": json.dumps(missing_by_phase),
+            "fuzziness_flags": _flags_to_json(unresolved_flags),
+            "client_profile_json": json.dumps(client_profile, ensure_ascii=False, indent=2),
+        })
+
+        messages = state.get("messages", [])
+        conversation = [("system", system_prompt)]
+        for msg in messages[-CONVERSATION_WINDOW:]:
+            if isinstance(msg, HumanMessage):
+                conversation.append(("human", msg.content))
+            elif isinstance(msg, AIMessage):
+                conversation.append(("ai", msg.content))
+
+        if len(conversation) == 1:
+            conversation.append(("human", "Namaskar, mujhe apni baat batani hai."))
+
+        try:
+            response = await llm.with_structured_output(CrossQuestionOutput).ainvoke(conversation)
+            parsed = response.model_dump()
+        except Exception as exc:
+            logger.error("cross_question_node LLM failure: %s", exc)
+            fallback_msg = "Kripya dobara bolein." if language == "hi" else "Please repeat that."
+            parsed = {
+                "spoken_response": fallback_msg,
+                "next_question": fallback_msg,
+                "reason": "llm_failure_fallback",
+                "interview_stage_after": current_stage,
+                "updated_fact_candidates": [],
+                "client_profile_update": {},
+                "requires_human_review": False,
+            }
+
+        spoken_response = parsed.get("spoken_response", "")
+        next_question = parsed.get("next_question", spoken_response)
+        candidates = parsed.get("updated_fact_candidates", [])
+        new_stage = parsed.get("interview_stage_after", current_stage)
+        profile_update = parsed.get("client_profile_update") or {}
+
+        updated_profile = {**client_profile}
+        for k, v in profile_update.items():
+            if v is not None and v != "" and v != [] and v != {}:
+                updated_profile[k] = v
+
+        client_answer: str = interrupt(value={
+            "spoken_response": spoken_response,
+            "next_question": next_question,
+            "interview_stage": current_stage,
+        })
+
+        turn_id = f"turn_{uuid.uuid4().hex[:8]}"
+        new_facts: list[Fact] = []
+
+        for candidate in candidates:
+            if not candidate.get("field") or not candidate.get("value"):
+                continue
+            new_facts.append(Fact(
+                fact_id=f"F-{uuid.uuid4().hex[:8]}_cq",
+                field=candidate["field"],
+                value=candidate["value"],
+                evidence_type="CLIENT_STATED",
+                source_ref=turn_id,
+                confidence=candidate.get("confidence", 0.7),
+                status="unconfirmed",
+                contradicts=[],
+                epistemic_status=candidate.get("epistemic_status", "direct"),
+            ))
+
+        if client_answer and client_answer.strip():
+            next_field = get_next_priority_field(facts + new_facts) or "general_statement"
+            new_facts.append(Fact(
+                fact_id=f"F-{uuid.uuid4().hex[:8]}_raw",
+                field=next_field,
+                value=client_answer,
+                evidence_type="CLIENT_STATED",
+                source_ref=turn_id,
+                confidence=0.5,
+                status="unconfirmed",
+                contradicts=[],
+            ))
+
+        law_ctx_update = {}
+        accident_date_fact = next(
+            (f for f in new_facts if f.field == "accident_datetime"), None
+        )
+        if accident_date_fact:
+            law_ctx_update["law_version_context"] = get_applicable_law(accident_date_fact.value)
+
+        return {
+            "facts": new_facts,
+            "interview_stage": new_stage,
+            "client_profile": updated_profile,
+            **law_ctx_update,
+            "messages": [
+                AIMessage(content=spoken_response),
+                HumanMessage(content=client_answer),
+            ],
+        }
+
+    except Exception as exc:
+        logger.error("cross_question_node error: %s", exc, exc_info=True)
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Node 3 — Fuzziness Detector
+# ---------------------------------------------------------------------------
+
+async def fuzziness_detector_node(state: CaseState) -> dict:
+    """
+    Runs after every new fact is added. Detects contradictions, timeline
+    conflicts, vague accounts, missing documents, liability ambiguity, and
+    jurisdiction ambiguity. Deduplicates on (flag_type, fact_refs), not
+    on LLM-generated flag_ids which are effectively random.
+    """
+    try:
+        llm = _flash_llm()
+        facts = state.get("facts", [])
+        timeline = state.get("timeline", [])
+
+        if not facts:
+            return {"fuzziness_flags": []}
+
+        system_prompt = render_prompt("fuzziness_detector.yaml", {
+            "facts_json": _facts_to_json(facts),
+            "timeline_json": json.dumps(timeline, ensure_ascii=False),
+        })
+
+        try:
+            response = await llm.with_structured_output(FuzzinessOutput).ainvoke(
+                [("system", system_prompt)]
+            )
+            raw_flags = response.model_dump().get("flags", [])
+        except Exception as exc:
+            logger.error("fuzziness_detector_node LLM failure (NOT zero flags): %s", exc)
+            return {"fuzziness_flags": [], "_fuzziness_node_error": True}
+
+        existing_sigs = {
+            (f.flag_type, frozenset(f.fact_refs))
+            for f in state.get("fuzziness_flags", [])
+        }
+        new_flags: list[FuzzinessFlag] = []
+
+        for raw in raw_flags:
+            try:
+                flag = FuzzinessFlag(
+                    flag_id=raw.get("flag_id", f"FZ-{uuid.uuid4().hex[:8]}"),
+                    flag_type=raw["type"],
+                    severity=raw.get("severity", "medium"),
+                    fact_refs=raw.get("fact_refs", []),
+                    explanation=raw.get("explanation", ""),
+                    neutral_clarifying_question=raw.get("neutral_clarifying_question", ""),
+                    blocks_handoff=raw.get("blocks_handoff", False),
+                    resolved=False,
+                )
+                sig = (flag.flag_type, frozenset(flag.fact_refs))
+                if sig not in existing_sigs:
+                    new_flags.append(flag)
+                    existing_sigs.add(sig)
+            except Exception as parse_err:
+                logger.warning("Could not parse fuzziness flag: %s — %s", raw, parse_err)
+
+        return {"fuzziness_flags": new_flags}
+
+    except Exception as exc:
+        logger.error("fuzziness_detector_node error: %s", exc, exc_info=True)
+        return {"fuzziness_flags": []}
+
+
+# ---------------------------------------------------------------------------
+# Node 4 — Entity / Character-Tree Tracker
+# ---------------------------------------------------------------------------
+
+async def entity_tracker_node(state: CaseState) -> dict:
+    """
+    Extracts people, vehicles, events, relationships, timeline entries, and
+    victim profile data from the conversation. Updates entity graph,
+    timeline, and client_profile (for MACT quantum calculation).
+    """
+    try:
+        llm = _flash_llm()
+        messages = state.get("messages", [])
+        facts = state.get("facts", [])
+        client_profile = state.get("client_profile") or {}
+
+        transcript_lines = []
+        for msg in messages[-TRANSCRIPT_WINDOW:]:
+            if isinstance(msg, HumanMessage):
+                transcript_lines.append(f"CLIENT: {msg.content}")
+            elif isinstance(msg, AIMessage):
+                transcript_lines.append(f"NYAYA: {msg.content}")
+        transcript = "\n".join(transcript_lines)
+
+        system_prompt = render_prompt("fact_extraction.yaml", {
+            "transcript": transcript,
+            "existing_facts": _facts_to_json(facts),
+            "existing_client_profile": json.dumps(client_profile, ensure_ascii=False),
+        })
+
+        try:
+            response = await llm.with_structured_output(EntityTrackerOutput).ainvoke([
+                ("system", system_prompt),
+                ("human", "Extract entities, timeline, new_facts, and client_profile_update."),
+            ])
+            parsed = response.model_dump()
+        except Exception as exc:
+            logger.error("entity_tracker_node LLM failure: %s", exc)
+            return {"_entity_tracker_error": True}
+
+        entity_graph = parsed.get(
+            "entity_graph", state.get("entity_graph", {"nodes": [], "edges": []})
+        )
+        timeline = parsed.get("timeline", state.get("timeline", []))
+
+        raw_facts = parsed.get("new_facts", [])
+        new_facts: list[Fact] = []
+        for rf in raw_facts:
+            try:
+                evidence_type = rf.get("evidence_type", "UNKNOWN")
+                if evidence_type not in (
+                    "CLIENT_STATED", "DOCUMENT_EXTRACTED",
+                    "LEGAL_SOURCE", "INFERENCE", "UNKNOWN"
+                ):
+                    evidence_type = "UNKNOWN"
+                new_facts.append(Fact(
+                    fact_id=rf.get("fact_id", f"F-{uuid.uuid4().hex[:8]}_et"),
+                    field=rf.get("field", "unknown"),
+                    value=rf.get("value", ""),
+                    evidence_type=evidence_type,
+                    source_ref=rf.get("source_ref", "entity_tracker"),
+                    confidence=rf.get("confidence", 0.5),
+                    status="unconfirmed",
+                    contradicts=rf.get("contradicts", []),
+                    epistemic_status=rf.get("epistemic_status"),
+                ))
+            except Exception:
+                pass
+
+        profile_update = parsed.get("client_profile_update") or {}
+        updated_profile = {**client_profile}
+        for k, v in profile_update.items():
+            if v is not None and v != "" and v != [] and v != {}:
+                updated_profile[k] = v
+
+        result: dict = {
+            "entity_graph": entity_graph,
+            "timeline": timeline,
+            "facts": new_facts,
+        }
+        if updated_profile != client_profile:
+            result["client_profile"] = updated_profile
+
+        return result
+
+    except Exception as exc:
+        logger.error("entity_tracker_node error: %s", exc, exc_info=True)
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Node 5 — Document Request Agent
+# ---------------------------------------------------------------------------
+
+async def document_request_node(state: CaseState) -> dict:
+    """
+    Identifies which documents are needed, issues structured requests, and
+    classifies BSA §63 certificate requirement via a structured LLM call
+    against a closed taxonomy (not substring matching on LLM-written labels).
+    """
+    pending = [
+        doc for doc in state.get("documents", [])
+        if doc.upload_status == "requested"
+        and doc.doc_id not in (state.get("document_requests_notified") or [])
+    ]
+    if not pending:
+        return {}
+    names = ", ".join(doc.doc_type.replace("_", " ") for doc in pending)
+    request_message = (
+        f"कृपया {names} की कॉपी अपलोड करें। अभी उपलब्ध नहीं है तो बता दीजिए।"
+        if state.get("language", "hi") == "hi" else
+        f"Please upload a copy of {names}. Tell me if it is not available right now."
+    )
+    answer = interrupt(value={
+        "spoken_response": request_message,
+        "pending_documents": [{"doc_id": doc.doc_id, "doc_type": doc.doc_type} for doc in pending],
+    })
+    # Only the multipart OCR endpoint may mark a document uploaded/processed.
+    return {
+        "document_requests_notified": list(dict.fromkeys(
+            (state.get("document_requests_notified") or []) + [doc.doc_id for doc in pending]
+        )),
+        "messages": [HumanMessage(content=str(answer or ""))],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node 2b — Ask Node (deterministic, zero LLM calls before interrupt)
+# ---------------------------------------------------------------------------
+
+async def ask_node(state: CaseState) -> dict:
+    """
+    Picks the next question deterministically (no LLM) and suspends via
+    interrupt(). On resume, LangGraph routes to extract_merge_node.
+
+    Flow:
+      1. Initialise `intake_engine_state` on first call.
+      2. Emergency check (turn 0 only) — if intake marks emergency, ask safety
+         question first.
+      3. Otherwise ask `next_question()`.
+      4. If no more questions → transition to confirmation phase.
+    """
+    intake: dict = state.get("intake_engine_state") or new_intake()
+    lang: str = state.get("language") or "hi"
+    turns: int = intake.get("turns", 0)
+
+    # Emergency safety check on very first turn
+    if intake.get("emergency"):
+        nq = safety_question(lang)
+    else:
+        nq = next_question(intake, lang)
+
+    if nq is None:
+        # All questions answered — hand off to confirmation flow
+        return {
+            "intake_engine_state": intake,
+            "intake_phase": "confirmation",
+        }
+
+    # Pure Python: store the question, then suspend
+    msg = AIMessage(content=nq["text"])
+    answer: str = interrupt(value={
+        "spoken_response": nq["text"],
+        "key": nq["key"],
+        "stage": nq.get("stage", "engage"),
+    })
+
+    return {
+        "intake_engine_state": intake,
+        "current_question": nq,
+        "interview_stage": nq.get("stage", "engage"),
+        "messages": [msg, HumanMessage(content=answer)],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node 2c — Extract-Merge Node (single LLM call, updates CaseState projections)
+# ---------------------------------------------------------------------------
+
+async def extract_merge_node(state: CaseState) -> dict:
+    """
+    Runs after the user responds to ask_node's interrupt.
+    1. Extracts structured facts from the raw answer via IntakeExtractor.
+    2. Merges into the deterministic engine state (transactional, quote-verified).
+    3. Projects updated engine state → CaseState fields (facts, client_profile,
+       timeline, entity_graph, fuzziness_flags).
+    4. Advances to next turn.
+    """
+    intake: dict = state.get("intake_engine_state") or new_intake()
+    asked: dict | None = state.get("current_question")
+    lang: str = state.get("language") or "hi"
+
+    # Recover the user's answer — last HumanMessage in state
+    messages = state.get("messages", [])
+    answer_text = ""
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            answer_text = msg.content or ""
+            break
+
+    msg_id = f"msg_{uuid.uuid4().hex[:8]}"
+
+    try:
+        result = await IntakeExtractor().aextract(intake, answer_text, asked)
+    except Exception as exc:
+        logger.error("IntakeExtractor.aextract failed: %s", type(exc).__name__)
+        # Keep the graph at this extraction step so the saved answer can be
+        # retried. Never claim it was recorded or advance a clarification cap.
+        raise RuntimeError("Interview processing is temporarily unavailable. Your spoken answer can be retried.") from exc
+
+    if result is not None:
+        try:
+            intake = process_turn(intake, result, msg_id, answer_text, asked)
+        except MergeError as me:
+            logger.warning("MergeError (non-fatal, turn skipped): %s", me)
+            intake = register_failed_turn(intake, asked, msg_id, answer_text, str(me))
+
+    # Apply date-based derivations (§166(3) limitation etc.)
+    apply_derivations(intake, dt.date.today())
+
+    # Project engine state → CaseState shapes
+    projected_facts = project_facts(intake)
+    projected_profile = project_profile(intake)
+    projected_timeline = project_timeline(intake)
+    projected_eg = project_entity_graph(intake)
+    projected_flags = derive_flags(intake, state.get("fuzziness_flags", []))
+
+    # Derive law version context from accident date if available
+    law_ctx = {}
+    acc_date = (intake.get("fields", {}).get("accident_datetime") or {}).get("value")
+    if acc_date:
+        law_ctx["law_version_context"] = get_applicable_law(acc_date)
+
+    stage = current_stage(intake)
+
+    # Request material records once the regulatory paper trail is discussed.
+    # These are actual outstanding upload requests, never fabricated uploads.
+    documents = list(state.get("documents", []))
+    if (asked or {}).get("key") in {"fir_charges_and_sections", "insurance_and_documents_available"}:
+        existing_types = {document.doc_type for document in documents}
+        reported = (intake["fields"].get("police_reported") or {}).get("value")
+        needed = ["fir_or_gd_copy"] if reported is True else []
+        if intake.get("people"):
+            needed.append("hospital_records")
+        for doc_type in needed:
+            if doc_type not in existing_types:
+                documents.append(DocumentRecord(doc_id=f"DOC-{uuid.uuid4().hex[:8]}", doc_type=doc_type, upload_status="requested"))
+
+    return {
+        "intake_engine_state": intake,
+        "facts": projected_facts,
+        "client_profile": projected_profile,
+        "victim_profile": project_victim_profile(intake),
+        "timeline": projected_timeline,
+        "entity_graph": projected_eg,
+        "fuzziness_flags": projected_flags,
+        "interview_stage": stage,
+        "documents": documents,
+        **law_ctx,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Consent helpers
+# ---------------------------------------------------------------------------
+
+async def _judge_consent(
+    llm: ChatGoogleGenerativeAI, question_asked: str, answer: str
+) -> tuple[str, str]:
+    """
+    LLM-judges client intent (yes/no/ambiguous). Defaults to 'ambiguous'
+    on failure — consent must never be silently assumed.
+    """
+    simple = str(answer).strip().lower().rstrip(".!। ")
+    if simple in {"yes", "haan", "ha", "हाँ", "हां", "yes, i agree", "yes, i agree to this step and authorize it", "haan, bhejiye"}:
+        return "yes", "Explicit affirmative response"
+    if simple in {"no", "nahi", "nahin", "नहीं", "no, i do not agree"}:
+        return "no", "Explicit negative response"
+    try:
+        prompt = render_prompt("consent_intent.yaml", {
+            "question_asked": question_asked,
+            "client_reply": answer,
+        })
+        response = await llm.with_structured_output(ConsentIntentOutput).ainvoke(
+            [("system", prompt)]
+        )
+        verdict = (
+            response.verdict
+            if response.verdict in ("yes", "no", "ambiguous")
+            else "ambiguous"
+        )
+        return verdict, response.reason
+    except Exception as exc:
+        logger.warning("Consent LLM classification failed, treating as ambiguous: %s", exc)
+        return "ambiguous", "classification_error_treated_as_ambiguous"
+
+
+async def _ask_consent_step(
+    llm: ChatGoogleGenerativeAI, step_key: str, prompt_text: str, state: CaseState
+) -> tuple[str, str, str]:
+    answer: str = interrupt(value={"spoken_response": prompt_text, "consent_step": step_key})
+    verdict, reason = await _judge_consent(llm, prompt_text, answer)
+    return answer, verdict, reason
+
+
+# ---------------------------------------------------------------------------
+# Nodes 6a–6d — Confirmation Flow (4 separate nodes, 1 interrupt each)
+#
+# WHY 4 NODES: LangGraph replays the entire node body on every resume.
+# Multiple interrupt()s in one node means every LLM call between them
+# re-executes on replay. By step 4 you'd have silently re-invoked
+# _judge_consent ~7 times instead of 4, and non-zero temperature can
+# flip an already-confirmed "yes" to "ambiguous".
+# One interrupt per node eliminates this entirely.
+# ---------------------------------------------------------------------------
+
+async def confirmation_step1_node(state: CaseState) -> dict:
+    """Consent step 1 — confirm recipient. One interrupt, no replay risk."""
+    llm = _flash_llm()
+    lawyer_name = state.get("lawyer_name") or DEFAULT_LAWYER_NAME
+    lawyer_contact = state.get("lawyer_contact") or "WhatsApp"
+    consent = state.get("consent") or ConsentRecord()
+
+    if consent.recipient_confirmed:
+        return {}
+
+    prompt = CONFIRMATION_FLOW_PROMPTS["STEP_1"].format(
+        lawyer_name=lawyer_name, recipient_channel=lawyer_contact,
+    )
+    for _attempt in range(CONSENT_MAX_RETRIES):
+        _, verdict, reason = await _ask_consent_step(llm, "recipient", prompt, state)
+        if verdict == "yes":
+            consent.recipient_confirmed = True
+            return {"consent": consent}
+        if verdict == "no":
+            return {"handoff_status": "declined", "consent": consent}
+        prompt = _retry_prompt(reason, lawyer_name)
+    return {"handoff_status": "pending", "consent": consent}
+
+
+async def confirmation_step2_node(state: CaseState) -> dict:
+    """Consent step 2 — confirm contents. Shows actual field names (informed consent)."""
+    llm = _flash_llm()
+    consent = state.get("consent") or ConsentRecord()
+    if consent.contents_confirmed:
+        return {}
+
+    facts = state.get("facts", [])
+    timeline_events = state.get("timeline", [])
+    open_flags = [f for f in state.get("fuzziness_flags", []) if not f.resolved]
+
+    unique_fields = list({f.field for f in facts})[:10]
+    fact_fields_str = ", ".join(unique_fields) or "koi baatein nahi"
+    facts_summary = f"{len(facts)} baatein ({fact_fields_str})"
+    timeline_summary = f"{len(timeline_events)} ghatnaayein"
+
+    prompt = CONFIRMATION_FLOW_PROMPTS["STEP_2"].format(
+        facts_summary=facts_summary,
+        timeline_summary=timeline_summary,
+        fuzziness_flag_count=len(open_flags),
+    )
+    for _attempt in range(CONSENT_MAX_RETRIES):
+        _, verdict, reason = await _ask_consent_step(llm, "contents", prompt, state)
+        if verdict == "yes":
+            consent.contents_confirmed = True
+            return {"consent": consent}
+        if verdict == "no":
+            return {"handoff_status": "declined", "consent": consent}
+        prompt = f"{reason} Kya brief ke contents theek hain? Sirf 'haan' ya 'nahin' boliye."
+    return {"handoff_status": "pending", "consent": consent}
+
+
+async def confirmation_step3_node(state: CaseState) -> dict:
+    """Consent step 3 — confirm attachments."""
+    llm = _flash_llm()
+    consent = state.get("consent") or ConsentRecord()
+    if consent.attachments_confirmed:
+        return {}
+
+    documents = state.get("documents", [])
+    doc_list = ", ".join(d.doc_type for d in documents) if documents else "koi document nahi"
+
+    prompt = CONFIRMATION_FLOW_PROMPTS["STEP_3"].format(
+        n=len(documents), document_list=doc_list,
+    )
+    for _attempt in range(CONSENT_MAX_RETRIES):
+        _, verdict, reason = await _ask_consent_step(llm, "attachments", prompt, state)
+        if verdict == "yes":
+            consent.attachments_confirmed = True
+            return {"consent": consent}
+        if verdict == "no":
+            return {"handoff_status": "declined", "consent": consent}
+        prompt = (
+            f"{reason} Kya ye {len(documents)} documents attach karne hain? "
+            f"Sirf 'haan' ya 'nahin' boliye."
+        )
+    return {"handoff_status": "pending", "consent": consent}
+
+
+async def confirmation_step4_node(state: CaseState) -> dict:
+    """Consent step 4 — final permission with real audit trail."""
+    llm = _flash_llm()
+    consent = state.get("consent") or ConsentRecord()
+    if consent.permission_confirmed:
+        return {}
+
+    prompt = CONFIRMATION_FLOW_PROMPTS["STEP_4"]
+    for _attempt in range(CONSENT_MAX_RETRIES):
+        _, verdict, reason = await _ask_consent_step(llm, "permission", prompt, state)
+        if verdict == "yes":
+            consent.permission_confirmed = True
+            now_iso = datetime.now(timezone.utc).isoformat()
+            consent.timestamp = now_iso
+            messages = state.get("messages", [])
+            # Real audit trail: message index + UTC timestamp (not a random UUID)
+            consent.consent_transcript_ref = f"msg_idx={len(messages)};ts={now_iso}"
+            return {
+                "handoff_status": "confirmed",
+                "consent": consent,
+                "intake_phase": "complete",
+            }
+        if verdict == "no":
+            return {"handoff_status": "declined", "consent": consent}
+        prompt = f"{reason} Kripya final permission dein — sirf 'haan' ya 'nahin' boliye."
+    return {"handoff_status": "pending", "consent": consent}

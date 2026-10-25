@@ -1,0 +1,74 @@
+name: nyayalens
+
+services:
+  backend:
+    build: ./backend
+    env_file: ./backend/.env
+    environment:
+      SQLITE_CHECKPOINT_PATH: /data/checkpoints.db
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in deploy/.env}
+    volumes:
+      - case_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 15s
+      timeout: 6s
+      retries: 5
+      start_period: 30s
+    expose:
+      - "8000"
+
+  database:
+    build:
+      context: ./web
+      target: database
+    environment:
+      DATABASE_URL: file:/data/web.db
+    volumes:
+      - web_data:/data
+    command: ["sh", "-c", "sqlite3 /data/web.db 'PRAGMA user_version=0;' && npx prisma db push && chown -R 1001:1001 /data"]
+    restart: "no"
+
+  web:
+    build:
+      context: ./web
+      target: runner
+    environment:
+      BACKEND_URL: http://backend:8000
+      NEXT_PUBLIC_BACKEND_URL: ""
+      NEXT_PUBLIC_BASE_URL: https://${APP_DOMAIN:-nyayalens.abhi07.xyz}
+      DATABASE_URL: file:/data/web.db
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in deploy/.env}
+    volumes:
+      - web_data:/data
+    depends_on:
+      backend:
+        condition: service_healthy
+      database:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    expose:
+      - "3000"
+
+  gateway:
+    image: caddy:2-alpine
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:-nyayalens.abhi07.xyz}
+      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL in deploy/.env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+    restart: unless-stopped
+
+volumes:
+  case_data:
+  web_data:
+  caddy_data:
+  caddy_config:

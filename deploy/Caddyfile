@@ -1,0 +1,32 @@
+{
+  email {$ACME_EMAIL}
+}
+
+{$APP_DOMAIN} {
+  encode zstd gzip
+  request_body {
+    max_size 25MB
+  }
+  header {
+    X-Content-Type-Options nosniff
+    Referrer-Policy strict-origin-when-cross-origin
+    Permissions-Policy "microphone=(self), camera=()"
+  }
+  handle /api/thinking {
+    reverse_proxy web:3000 {
+      flush_interval -1
+    }
+  }
+  @backend path /api/session/* /api/voice/* /api/notifications/* /api/upload-document /api/tool-call /ws/* /health
+  handle @backend {
+    reverse_proxy backend:8000 {
+      flush_interval -1
+      transport http {
+        response_header_timeout 180s
+      }
+    }
+  }
+  handle {
+    reverse_proxy web:3000
+  }
+}

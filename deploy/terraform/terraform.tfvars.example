@@ -1,0 +1,6 @@
+project_id = "your-gcp-project-id"
+region = "asia-south1"
+zone = "asia-south1-c"
+instance_name = "nyayalens"
+domain_name = "nyayalens.abhi07.xyz"
+cloudflare_zone_id = "your-cloudflare-zone-id"
