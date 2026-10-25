@@ -114,8 +114,14 @@ export function useSarvamCall(sessionId?: string, language = 'hi') {
     transition('thinking')
     setError('')
     try {
+      if (blob.size < 256) throw new Error('I could not hear that response. Please check your microphone and try again.')
       const form = new FormData()
-      form.append('audio', blob, blob.type.includes('mp4') ? 'response.mp4' : 'response.webm')
+      // MediaRecorder may append codec parameters such as `;codecs=opus`.
+      // Sarvam accepts WebM/MP4 containers; use a canonical MIME type so the
+      // provider does not mistake a valid browser recording for an unknown one.
+      const mediaType = blob.type.toLowerCase().split(';', 1)[0]
+      const isMp4 = mediaType === 'audio/mp4'
+      form.append('audio', new File([blob], isMp4 ? 'response.mp4' : 'response.webm', { type: isMp4 ? 'audio/mp4' : 'audio/webm' }))
       form.append('language', language)
       controller.current = new AbortController()
       const reply = await readResponse<VoiceReply>(await fetch(`${BACKEND_URL}/api/voice/${sessionId}/turn`, { method: 'POST', body: form, signal: controller.current.signal }))

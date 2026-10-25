@@ -68,7 +68,20 @@ def _check_response(response: httpx.Response) -> None:
     if response.status_code == 429:
         raise HTTPException(status_code=429, detail="Speech service is busy. Please try again.", headers={"Retry-After": "3"})
     if response.status_code in (400, 422):
-        raise HTTPException(status_code=422, detail="Speech service could not process this audio or text. Please try a shorter recording.")
+        # Classify provider validation errors without returning its raw response
+        # (which may include request metadata) to the client or logs.
+        try:
+            body = response.json()
+            diagnostic = json.dumps(body, ensure_ascii=False).lower() if isinstance(body, (dict, list)) else ""
+        except ValueError:
+            diagnostic = ""
+        if any(term in diagnostic for term in ("duration", "30 second", "too long", "maximum length")):
+            detail = "This recording is over Sarvam’s 30-second limit. Please send a shorter response."
+        elif any(term in diagnostic for term in ("empty", "audio format", "read the file", "unsupported format", "invalid audio")):
+            detail = "I could not read that recording. Please try again, or use ‘Send response’ after speaking clearly."
+        else:
+            detail = "Speech service rejected this recording. Please try a shorter response, and check that your microphone captured audio."
+        raise HTTPException(status_code=422, detail=detail)
     raise HTTPException(status_code=502, detail="Speech service is temporarily unavailable. Please retry.")
 
 
