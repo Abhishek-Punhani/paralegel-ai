@@ -26,11 +26,11 @@ def test_new_intake_initialization():
     assert intake["turns"] == 0
     assert len(intake["people"]) == 0
     
-    # First question should be the opening narrative
+    # Establish the client's reason for seeking help before the detailed account.
     q = next_question(intake, lang="hi")
     assert q is not None
-    assert q["key"] == "how_accident_happened"
-    assert q["stage"] == "narrative"
+    assert q["key"] == "consultation_reason"
+    assert q["stage"] == "engage"
 
 
 def test_contradiction_is_asked_before_other_missing_fields():

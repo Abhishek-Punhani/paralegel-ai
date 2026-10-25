@@ -9,7 +9,7 @@ from langgraph.types import Command
 from app.graphs.checkpoints import PersistentSqliteSaver
 from app.intake_engine.engine import (
     Extraction, MergeError, NewPerson, TimelineEvent, Update,
-    merge, new_intake, project_profile, project_timeline, project_victim_profile,
+    merge, new_intake, process_turn, project_profile, project_timeline, project_victim_profile,
 )
 from app.state import CaseState, CitationRecord, ConsentRecord, Fact
 
@@ -30,7 +30,7 @@ def test_persistent_graph_can_resume_after_rebuilding(tmp_path):
     config = {"configurable": {"thread_id": "persistent-client"}}
     asyncio.run(graph.ainvoke({"thread_id": "persistent-client", "language": "en", "messages": [], "facts": [], "documents": [], "fuzziness_flags": [], "consent": ConsentRecord()}, config))
     prompt = graph.get_state(config).tasks[0].interrupts[0].value
-    assert prompt["key"] == "how_accident_happened"
+    assert prompt["key"] == "consultation_reason"
     second = PersistentSqliteSaver(sqlite3.connect(path, check_same_thread=False))
     restored = build_intake_graph(second)
     assert restored.get_state(config).tasks[0].interrupts[0].value == prompt
@@ -106,6 +106,83 @@ def test_client_and_victim_profiles_are_not_conflated():
     assert project_profile(intake)["age"] == 45
     victim = project_victim_profile(intake)["people"][0]
     assert victim["fields"]["victim_age_and_dob"]["value"] == "12"
+
+
+def test_explicit_self_profile_reuses_grounded_facts_with_provenance():
+    text = (
+        "I am Ramesh, age 34, an electrician earning 28000 monthly. "
+        "I have salary slips, support my wife and child, had no previous injury, "
+        "have 20 percent disability, and cannot climb ladders."
+    )
+    values = {
+        "full_name": ("Ramesh", "Ramesh"),
+        "age": ("34", "34"),
+        "occupation": ("electrician", "electrician"),
+        "monthly_income": ("28000", "28000"),
+        "income_proof_type": ("salary slips", "salary slips"),
+        "dependents": ("wife and child", "wife and child"),
+        "pre_existing_conditions": ("no previous injury", "no previous injury"),
+        "disability_percentage": ("20", "20 percent disability"),
+        "functional_disability_impact": ("cannot climb ladders", "cannot climb ladders"),
+    }
+    intake = process_turn(new_intake(), Extraction(
+        people=[NewPerson(id="p1", label="Ramesh", quote="Ramesh")],
+        updates=[Update(field=key, value=value, quote=quote, status="answered") for key, (value, quote) in values.items()],
+    ), "profile-turn", text, None)
+    assert intake["people"]["p1"]["fields"].get("victim_full_name", {}).get("value") is None
+
+    answer = "I am the injured person."
+    intake = process_turn(intake, Extraction(updates=[Update(
+        field="victim_relationship_to_client", person_id="p1", value="self", quote="I am the injured person", status="answered",
+    )]), "identity-turn", answer, None)
+    mappings = {
+        "full_name": "victim_full_name", "age": "victim_age_and_dob",
+        "occupation": "victim_occupation_and_employer", "monthly_income": "victim_income_and_proof",
+        "income_proof_type": "victim_income_proof", "dependents": "victim_dependents",
+        "pre_existing_conditions": "victim_pre_existing_conditions",
+        "disability_percentage": "victim_disability_assessment",
+        "functional_disability_impact": "victim_functional_impact",
+    }
+    for source, target in mappings.items():
+        original = intake["fields"][source]
+        copied = intake["people"]["p1"]["fields"][target]
+        assert copied == original
+        assert copied is not original
+        assert copied["history"] is not original["history"]
+        assert copied["source"] == "profile-turn"
+        assert copied["quote"] in text
+
+
+def test_client_profile_never_bleeds_into_daughter_profile():
+    text = "I am Ramesh, 45. My daughter Sita is 12."
+    intake = process_turn(new_intake(), Extraction(
+        people=[NewPerson(id="p1", label="daughter Sita", quote="daughter Sita")],
+        updates=[
+            Update(field="full_name", value="Ramesh", status="answered", quote="Ramesh"),
+            Update(field="age", value="45", status="answered", quote="45"),
+            Update(field="victim_age_and_dob", person_id="p1", value="12", status="answered", quote="Sita is 12"),
+            Update(field="victim_relationship_to_client", person_id="p1", value="daughter", status="answered", quote="My daughter Sita"),
+        ],
+    ), "family-turn", text, None)
+    assert project_profile(intake)["full_name"] == "Ramesh"
+    victim = project_victim_profile(intake)["people"][0]["fields"]
+    assert victim["victim_age_and_dob"]["value"] == "12"
+    assert "victim_full_name" not in victim
+
+
+def test_self_profile_reuse_preserves_victim_unknowns_and_independent_facts():
+    text = "I am Ramesh and earn 28000. I am the injured person. I do not want to provide victim income proof."
+    intake = process_turn(new_intake(), Extraction(
+        people=[NewPerson(id="p1", label="Ramesh", quote="Ramesh")],
+        updates=[
+            Update(field="monthly_income", value="28000", status="answered", quote="28000"),
+            Update(field="victim_relationship_to_client", person_id="p1", value="self", status="answered", quote="I am the injured person"),
+            Update(field="victim_income_and_proof", person_id="p1", value=None, status="declined", quote="I do not want to provide victim income proof"),
+        ],
+    ), "private-turn", text, None)
+    victim_income = intake["people"]["p1"]["fields"]["victim_income_and_proof"]
+    assert victim_income["status"] == "declined"
+    assert victim_income["value"] is None
 
 
 def test_packet_contains_actual_citations_and_all_seven_sections():

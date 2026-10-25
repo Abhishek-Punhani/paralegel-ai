@@ -36,6 +36,19 @@ _PROFILE_KEYS = {
     "employment_type", "monthly_income", "income_proof_type", "dependents",
     "driving_license_number", "driving_license_validity", "criminal_history",
     "pre_existing_conditions", "disability_percentage", "functional_disability_impact",
+    "client_role", "contact_phone", "residential_location", "relationship_to_victim",
+}
+
+_SELF_PROFILE_FIELDS = {
+    "full_name": "victim_full_name",
+    "age": "victim_age_and_dob",
+    "occupation": "victim_occupation_and_employer",
+    "monthly_income": "victim_income_and_proof",
+    "income_proof_type": "victim_income_proof",
+    "dependents": "victim_dependents",
+    "pre_existing_conditions": "victim_pre_existing_conditions",
+    "disability_percentage": "victim_disability_assessment",
+    "functional_disability_impact": "victim_functional_impact",
 }
 
 
@@ -380,9 +393,32 @@ def process_turn(intake: dict, result: Extraction, message_id: str, text: str,
         out["raw_notes"].append({"id": message_id, "text": text, "question_key": (asked or {}).get("key"),
                                  "reason": "Unverified extraction omitted for: " + ", ".join(result.rejected_fields)})
     out["turns"] += 1
+    sync_explicit_self_profile(out)
     _bump_clarification(out, asked)
     apply_derivations(out, today or dt.date.today())
     return out
+
+
+def sync_explicit_self_profile(intake: dict) -> None:
+    """Reuse already quoted client facts only after explicit self-identification.
+
+    A matching name or the existence of one injured person is insufficient.
+    Unknowns, refusals, and facts independently supplied for a victim remain
+    untouched. Deep copies retain the original quote, source and fact history.
+    """
+    for person in intake.get("people", {}).values():
+        fields = person.get("fields", {})
+        relation = fields.get("victim_relationship_to_client") or {}
+        if relation.get("status") != "answered" or relation.get("value") != "self":
+            continue
+        for source_key, target_key in _SELF_PROFILE_FIELDS.items():
+            source = intake.get("fields", {}).get(source_key) or {}
+            target = fields.get(target_key) or {}
+            if source.get("status") not in {"answered", "partial", "conflicting"} or source.get("value") is None:
+                continue
+            if target.get("status", "unanswered") != "unanswered":
+                continue
+            fields[target_key] = copy.deepcopy(source)
 
 
 def register_failed_turn(intake: dict, asked: Optional[dict], message_id: str, text: str, reason: str) -> dict:
