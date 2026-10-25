@@ -10,7 +10,7 @@ SARVAM_API_KEY = os.getenv("SARVAM_API_KEY") or os.getenv("SARVAM_API_SUBSCRIPTI
 SARVAM_API_BASE_URL = os.getenv("SARVAM_API_BASE_URL", "https://api.sarvam.ai").rstrip("/")
 SARVAM_STT_MODEL = os.getenv("SARVAM_STT_MODEL", "saaras:v4")
 SARVAM_TTS_MODEL = os.getenv("SARVAM_TTS_MODEL", "bulbul:v4-flash")
-SARVAM_TTS_SPEAKER = os.getenv("SARVAM_TTS_SPEAKER", "shubh_enhi_ads")
+SARVAM_TTS_SPEAKER = os.getenv("SARVAM_TTS_SPEAKER", "ishita_enhi_customer")
 
 if not GOOGLE_API_KEY:
     import warnings

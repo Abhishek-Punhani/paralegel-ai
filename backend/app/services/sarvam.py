@@ -121,9 +121,9 @@ async def stream_speech(text: str, language: str) -> AsyncIterator[bytes]:
     code = language_code(language)
     model = SARVAM_TTS_MODEL
     speaker = SARVAM_TTS_SPEAKER
-    # v4 does not offer Malayalam or Odia voices yet; use the documented v3.
+    # v4 has no Malayalam or Odia personas yet; keep the fallback feminine.
     if code in {"ml-IN", "od-IN"} and model == "bulbul:v4-flash":
-        model, speaker = "bulbul:v3", "shubh"
+        model, speaker = "bulbul:v3", ("pooja" if code == "ml-IN" else "ritu")
     try:
         async with _http_client().stream(
             "POST", "/text-to-speech/stream",
